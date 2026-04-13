@@ -4,17 +4,16 @@
 Local horizon + Fresnel clearance + diffraction loss scan
 for VHF/UHF contest site selection.
 
-This script:
-- Loads a local DEM (GeoTIFF, EPSG:4326)
-- Generates candidate sites around Plovdiv
-- Evaluates local horizon toward a W/NW azimuth sector
-- Computes 60% first Fresnel zone clearance
-- Computes approximate knife-edge diffraction loss
-- Outputs ranked candidate sites
+This version:
+- reads all configuration from config.json
+- supports frequency selection from JSON
+- optionally allows CLI override for frequency
 """
 
 import math
 import csv
+import json
+import argparse
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,33 +23,25 @@ import matplotlib.pyplot as plt
 
 
 # ============================================================
-# CONFIGURATION
+# CLI
 # ============================================================
 
-DEM_FILE = "output_hh.tif"
-
-CENTER_LAT = 42.1354   # Plovdiv
-CENTER_LON = 24.7453
-
-RADIUS_KM = 60.0
-GRID_STEP_KM = 2.5
-
-MIN_SITE_ELEV_M = 300.0
-ANTENNA_HEIGHT_M = 8.0
-
-LOOK_DISTANCE_KM = 30.0
-PROFILE_STEP_M = 250.0
-
-AZIMUTH_START_DEG = 260.0
-AZIMUTH_END_DEG = 330.0
-AZIMUTH_STEP_DEG = 5.0
-
-FREQ_MHZ = 144.0
-
-EARTH_RADIUS_M = 6371000.0
-K_FACTOR = 4.0 / 3.0
-
-geod = Geod(ellps="WGS84")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Scan candidate sites using local horizon, Fresnel clearance and diffraction loss."
+    )
+    parser.add_argument(
+        "-c", "--config",
+        default="config.json",
+        help="Path to JSON configuration file (default: config.json)"
+    )
+    parser.add_argument(
+        "--freq-mhz",
+        type=float,
+        default=None,
+        help="Override frequency from config.json"
+    )
+    return parser.parse_args()
 
 
 # ============================================================
@@ -115,312 +106,360 @@ class DEMSampler:
 
 
 # ============================================================
-# GEOMETRY / RF UTILS
+# RF SCANNER
 # ============================================================
 
-def destination_point(lat: float, lon: float, azimuth_deg: float, distance_km: float):
-    lon2, lat2, _ = geod.fwd(lon, lat, azimuth_deg, distance_km * 1000.0)
-    return lat2, lon2
+class RFScanner:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.geod = Geod(ellps="WGS84")
 
+        self.dem_file = cfg["dem_file"]
 
-def generate_candidate_grid(center_lat, center_lon, radius_km, step_km):
-    pts = []
-    n = int((2 * radius_km) / step_km) + 1
+        self.center_lat = cfg["center"]["lat"]
+        self.center_lon = cfg["center"]["lon"]
+        self.center_name = cfg["center"].get("name", "Center")
 
-    for i in range(n):
-        north_km = -radius_km + i * step_km
-        for j in range(n):
-            east_km = -radius_km + j * step_km
+        self.radius_km = cfg["scan"]["radius_km"]
+        self.grid_step_km = cfg["scan"]["grid_step_km"]
+        self.min_site_elev_m = cfg["scan"]["min_site_elev_m"]
+        self.antenna_height_m = cfg["scan"]["antenna_height_m"]
 
-            if math.hypot(north_km, east_km) > radius_km:
+        self.look_distance_km = cfg["sector"]["look_distance_km"]
+        self.profile_step_m = cfg["sector"]["profile_step_m"]
+        self.azimuth_start_deg = cfg["sector"]["azimuth_start_deg"]
+        self.azimuth_end_deg = cfg["sector"]["azimuth_end_deg"]
+        self.azimuth_step_deg = cfg["sector"]["azimuth_step_deg"]
+
+        self.freq_mhz = cfg["radio"]["freq_mhz"]
+        self.k_factor = cfg["radio"]["k_factor"]
+
+        self.earth_radius_m = cfg["earth"]["radius_m"]
+
+        self.csv_file = cfg["output"]["csv_file"]
+        self.plot_file = cfg["output"]["plot_file"]
+        self.plot_title = cfg["output"]["plot_title"]
+
+        self.dem = DEMSampler(self.dem_file)
+
+    # --------------------------------------------------------
+    # Geometry
+    # --------------------------------------------------------
+
+    def destination_point(self, lat: float, lon: float, azimuth_deg: float, distance_km: float):
+        lon2, lat2, _ = self.geod.fwd(lon, lat, azimuth_deg, distance_km * 1000.0)
+        return lat2, lon2
+
+    def generate_candidate_grid(self):
+        pts = []
+        n = int((2 * self.radius_km) / self.grid_step_km) + 1
+
+        for i in range(n):
+            north_km = -self.radius_km + i * self.grid_step_km
+            for j in range(n):
+                east_km = -self.radius_km + j * self.grid_step_km
+
+                if math.hypot(north_km, east_km) > self.radius_km:
+                    continue
+
+                dist_km = math.hypot(north_km, east_km)
+                az = math.degrees(math.atan2(east_km, north_km)) % 360.0
+                lat, lon = self.destination_point(self.center_lat, self.center_lon, az, dist_km)
+                pts.append((lat, lon))
+
+        return pts
+
+    # --------------------------------------------------------
+    # RF utilities
+    # --------------------------------------------------------
+
+    def fresnel_radius_m(self, d1_m: float, d2_m: float) -> float:
+        freq_hz = self.freq_mhz * 1e6
+        wavelength_m = 3e8 / freq_hz
+        return math.sqrt(wavelength_m * d1_m * d2_m / (d1_m + d2_m))
+
+    def earth_bulge_m(self, d1_m: float, d2_m: float) -> float:
+        reff = self.earth_radius_m * self.k_factor
+        return (d1_m * d2_m) / (2.0 * reff)
+
+    @staticmethod
+    def knife_edge_loss_db(nu: float) -> float:
+        if nu <= -0.78:
+            return 0.0
+        return 6.9 + 20.0 * math.log10(
+            math.sqrt((nu - 0.1) ** 2 + 1.0) + nu - 0.1
+        )
+
+    # --------------------------------------------------------
+    # Profile analysis
+    # --------------------------------------------------------
+
+    def sample_along_azimuth(self, lat: float, lon: float, azimuth_deg: float):
+        total_m = self.look_distance_km * 1000.0
+        n = max(2, int(total_m / self.profile_step_m) + 1)
+        dists = np.linspace(0.0, total_m, n)
+
+        elev = []
+        valid = True
+
+        for d in dists:
+            lonx, latx, _ = self.geod.fwd(lon, lat, azimuth_deg, d)
+            h = self.dem.sample(lonx, latx)
+            elev.append(h)
+            if np.isnan(h):
+                valid = False
+
+        return dists, np.array(elev, dtype=float), valid
+
+    def evaluate_azimuth(self, lat: float, lon: float, azimuth_deg: float):
+        dists, terr, valid = self.sample_along_azimuth(lat, lon, azimuth_deg)
+
+        if not valid or len(dists) < 3:
+            return None
+
+        site_ground = terr[0]
+        if np.isnan(site_ground):
+            return None
+
+        tx_abs = site_ground + self.antenna_height_m
+        rx_abs = terr[-1] + self.antenna_height_m
+
+        total_m = dists[-1]
+        los = tx_abs + (rx_abs - tx_abs) * (dists / total_m)
+
+        horizon_angles = []
+        fresnel_clearances = []
+        nus = []
+        losses = []
+
+        for i in range(1, len(dists) - 1):
+            d = dists[i]
+
+            # Ignore the first 500 m to reduce pixel noise near the site
+            if d < 500.0:
                 continue
 
-            dist_km = math.hypot(north_km, east_km)
-            az = math.degrees(math.atan2(east_km, north_km)) % 360.0
-            lat, lon = destination_point(center_lat, center_lon, az, dist_km)
-            pts.append((lat, lon))
+            d1 = d
+            d2 = total_m - d
 
-    return pts
+            bulge = self.earth_bulge_m(d1, d2)
+            effective_terrain = terr[i] + bulge
 
+            angle_deg = math.degrees(math.atan2(effective_terrain - tx_abs, d1))
+            horizon_angles.append(angle_deg)
 
-def fresnel_radius_m(d1_m: float, d2_m: float, freq_mhz: float) -> float:
-    freq_hz = freq_mhz * 1e6
-    wavelength_m = 3e8 / freq_hz
-    return math.sqrt(wavelength_m * d1_m * d2_m / (d1_m + d2_m))
+            fr = self.fresnel_radius_m(d1, d2)
+            clearance = los[i] - effective_terrain - 0.6 * fr
+            fresnel_clearances.append(clearance)
 
+            h = effective_terrain - los[i]
+            nu = math.sqrt(2.0) * h / fr
+            nus.append(nu)
 
-def earth_bulge_m(d1_m: float, d2_m: float, k_factor: float = K_FACTOR) -> float:
-    reff = EARTH_RADIUS_M * k_factor
-    return (d1_m * d2_m) / (2.0 * reff)
+            loss_db = self.knife_edge_loss_db(nu)
+            losses.append(loss_db)
 
+        if not horizon_angles or not fresnel_clearances or not losses:
+            return None
 
-def knife_edge_loss_db(nu: float) -> float:
-    """
-    ITU-style single knife-edge approximation.
-    """
-    if nu <= -0.78:
-        return 0.0
-    return 6.9 + 20.0 * math.log10(
-        math.sqrt((nu - 0.1) ** 2 + 1.0) + nu - 0.1
-    )
+        horizon_angles = np.array(horizon_angles, dtype=float)
+        fresnel_clearances = np.array(fresnel_clearances, dtype=float)
+        nus = np.array(nus, dtype=float)
+        losses = np.array(losses, dtype=float)
 
+        return {
+            "worst_horizon_deg": float(np.percentile(horizon_angles, 99)),
+            "avg_horizon_deg": float(np.percentile(horizon_angles, 95)),
+            "min_fresnel_clearance_m": float(np.min(fresnel_clearances)),
+            "avg_fresnel_clearance_m": float(np.mean(fresnel_clearances)),
+            "max_diffraction_loss_db": float(np.max(losses)),
+            "worst_nu": float(np.max(nus)),
+        }
 
-# ============================================================
-# PROFILE ANALYSIS
-# ============================================================
+    # --------------------------------------------------------
+    # Site evaluation
+    # --------------------------------------------------------
 
-def sample_along_azimuth(dem, lat, lon, azimuth_deg, look_distance_km, step_m):
-    total_m = look_distance_km * 1000.0
-    n = max(2, int(total_m / step_m) + 1)
-    dists = np.linspace(0.0, total_m, n)
+    def evaluate_site(self, lat: float, lon: float):
+        elev = self.dem.sample(lon, lat)
+        if np.isnan(elev) or elev < self.min_site_elev_m:
+            return None
 
-    elev = []
-    valid = True
-
-    for d in dists:
-        lonx, latx, _ = geod.fwd(lon, lat, azimuth_deg, d)
-        h = dem.sample(lonx, latx)
-        elev.append(h)
-        if np.isnan(h):
-            valid = False
-
-    return dists, np.array(elev, dtype=float), valid
-
-
-def evaluate_azimuth(dem, lat, lon, azimuth_deg):
-    dists, terr, valid = sample_along_azimuth(
-        dem=dem,
-        lat=lat,
-        lon=lon,
-        azimuth_deg=azimuth_deg,
-        look_distance_km=LOOK_DISTANCE_KM,
-        step_m=PROFILE_STEP_M,
-    )
-
-    if not valid or len(dists) < 3:
-        return None
-
-    site_ground = terr[0]
-    if np.isnan(site_ground):
-        return None
-
-    tx_abs = site_ground + ANTENNA_HEIGHT_M
-    rx_abs = terr[-1] + ANTENNA_HEIGHT_M
-
-    total_m = dists[-1]
-    los = tx_abs + (rx_abs - tx_abs) * (dists / total_m)
-
-    horizon_angles = []
-    fresnel_clearances = []
-    nus = []
-    losses = []
-
-    for i in range(1, len(dists) - 1):
-        d = dists[i]
-
-        if d < 500.0:
-            continue
-
-        d1 = d
-        d2 = total_m - d
-
-        bulge = earth_bulge_m(d1, d2, K_FACTOR)
-        effective_terrain = terr[i] + bulge
-
-        # Horizon angle
-        angle_deg = math.degrees(math.atan2(effective_terrain - tx_abs, d1))
-        horizon_angles.append(angle_deg)
-
-        # Fresnel
-        fr = fresnel_radius_m(d1, d2, FREQ_MHZ)
-        clearance = los[i] - effective_terrain - 0.6 * fr
-        fresnel_clearances.append(clearance)
-
-        # Knife-edge diffraction parameter nu
-        # h is positive if obstacle is above LOS
-        h = effective_terrain - los[i]
-        nu = math.sqrt(2.0) * h / fr
-        nus.append(nu)
-
-        loss_db = knife_edge_loss_db(nu)
-        losses.append(loss_db)
-
-    if not horizon_angles or not fresnel_clearances or not losses:
-        return None
-
-    horizon_angles = np.array(horizon_angles, dtype=float)
-    fresnel_clearances = np.array(fresnel_clearances, dtype=float)
-    nus = np.array(nus, dtype=float)
-    losses = np.array(losses, dtype=float)
-
-    return {
-        "worst_horizon_deg": float(np.percentile(horizon_angles, 99)),
-        "avg_horizon_deg": float(np.percentile(horizon_angles, 95)),
-        "min_fresnel_clearance_m": float(np.min(fresnel_clearances)),
-        "avg_fresnel_clearance_m": float(np.mean(fresnel_clearances)),
-        "max_diffraction_loss_db": float(np.max(losses)),
-        "worst_nu": float(np.max(nus)),
-    }
-
-
-# ============================================================
-# SITE EVALUATION
-# ============================================================
-
-def evaluate_site(dem, lat, lon):
-    elev = dem.sample(lon, lat)
-    if np.isnan(elev) or elev < MIN_SITE_ELEV_M:
-        return None
-
-    azimuths = np.arange(AZIMUTH_START_DEG, AZIMUTH_END_DEG + 0.1, AZIMUTH_STEP_DEG)
-
-    best_score = -1e9
-    best_result = None
-
-    for az in azimuths:
-        res = evaluate_azimuth(dem, lat, lon, float(az))
-        if res is None:
-            continue
-
-        worst_h = res["worst_horizon_deg"]
-        avg_h = res["avg_horizon_deg"]
-        min_fc = res["min_fresnel_clearance_m"]
-        avg_fc = res["avg_fresnel_clearance_m"]
-        max_loss = res["max_diffraction_loss_db"]
-        worst_nu = res["worst_nu"]
-
-        horizon_score = np.clip((3.0 - worst_h) / 3.0, 0.0, 1.0)
-        avg_h_score = np.clip((2.0 - avg_h) / 2.0, 0.0, 1.0)
-
-        min_fc_score = np.clip((min_fc + 100.0) / 200.0, 0.0, 1.0)
-        avg_fc_score = np.clip((avg_fc + 100.0) / 200.0, 0.0, 1.0)
-
-        # Lower diffraction loss is better
-        diff_score = np.clip((20.0 - max_loss) / 20.0, 0.0, 1.0)
-
-        elev_score = np.clip((elev - MIN_SITE_ELEV_M) / 1800.0, 0.0, 1.0)
-
-        score = (
-            0.22 * horizon_score +
-            0.10 * avg_h_score +
-            0.23 * min_fc_score +
-            0.10 * avg_fc_score +
-            0.25 * diff_score +
-            0.10 * elev_score
+        azimuths = np.arange(
+            self.azimuth_start_deg,
+            self.azimuth_end_deg + 0.1,
+            self.azimuth_step_deg
         )
 
-        if score > best_score:
-            best_score = score
-            best_result = SiteResult(
-                lat=lat,
-                lon=lon,
-                elev_m=float(elev),
-                score=float(score),
-                best_azimuth_deg=float(az),
-                worst_horizon_deg=float(worst_h),
-                avg_horizon_deg=float(avg_h),
-                min_fresnel_clearance_m=float(min_fc),
-                avg_fresnel_clearance_m=float(avg_fc),
-                max_diffraction_loss_db=float(max_loss),
-                worst_nu=float(worst_nu),
+        best_score = -1e9
+        best_result = None
+
+        for az in azimuths:
+            res = self.evaluate_azimuth(lat, lon, float(az))
+            if res is None:
+                continue
+
+            worst_h = res["worst_horizon_deg"]
+            avg_h = res["avg_horizon_deg"]
+            min_fc = res["min_fresnel_clearance_m"]
+            avg_fc = res["avg_fresnel_clearance_m"]
+            max_loss = res["max_diffraction_loss_db"]
+            worst_nu = res["worst_nu"]
+
+            horizon_score = np.clip((3.0 - worst_h) / 3.0, 0.0, 1.0)
+            avg_h_score = np.clip((2.0 - avg_h) / 2.0, 0.0, 1.0)
+            min_fc_score = np.clip((min_fc + 100.0) / 200.0, 0.0, 1.0)
+            avg_fc_score = np.clip((avg_fc + 100.0) / 200.0, 0.0, 1.0)
+            diff_score = np.clip((20.0 - max_loss) / 20.0, 0.0, 1.0)
+            elev_score = np.clip((elev - self.min_site_elev_m) / 1800.0, 0.0, 1.0)
+
+            score = (
+                0.22 * horizon_score +
+                0.10 * avg_h_score +
+                0.23 * min_fc_score +
+                0.10 * avg_fc_score +
+                0.25 * diff_score +
+                0.10 * elev_score
             )
 
-    return best_result
+            if score > best_score:
+                best_score = score
+                best_result = SiteResult(
+                    lat=lat,
+                    lon=lon,
+                    elev_m=float(elev),
+                    score=float(score),
+                    best_azimuth_deg=float(az),
+                    worst_horizon_deg=float(worst_h),
+                    avg_horizon_deg=float(avg_h),
+                    min_fresnel_clearance_m=float(min_fc),
+                    avg_fresnel_clearance_m=float(avg_fc),
+                    max_diffraction_loss_db=float(max_loss),
+                    worst_nu=float(worst_nu),
+                )
+
+        return best_result
+
+    # --------------------------------------------------------
+    # Run
+    # --------------------------------------------------------
+
+    def run(self):
+        candidates = self.generate_candidate_grid()
+        print(f"Generated candidate points: {len(candidates)}")
+        print(f"Frequency: {self.freq_mhz:.3f} MHz")
+
+        valid_dem_points = 0
+        high_enough_points = 0
+        results = []
+
+        for idx, (lat, lon) in enumerate(candidates, 1):
+            elev = self.dem.sample(lon, lat)
+
+            if not np.isnan(elev):
+                valid_dem_points += 1
+            if not np.isnan(elev) and elev >= self.min_site_elev_m:
+                high_enough_points += 1
+
+            r = self.evaluate_site(lat, lon)
+            if r is not None:
+                results.append(r)
+
+            if idx % 200 == 0:
+                print(f"Processed {idx}/{len(candidates)}")
+
+        print()
+        print("Debug summary")
+        print("-------------")
+        print("Valid DEM points:", valid_dem_points)
+        print("Points above MIN_SITE_ELEV_M:", high_enough_points)
+        print("Final result points:", len(results))
+        print()
+
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        print("Top 20 sites:")
+        for i, r in enumerate(results[:20], 1):
+            print(
+                f"{i:2d}. lat={r.lat:.5f}, lon={r.lon:.5f}, "
+                f"elev={r.elev_m:.0f} m, score={r.score:.3f}, "
+                f"worst_h={r.worst_horizon_deg:.2f}°, "
+                f"min_fc={r.min_fresnel_clearance_m:.1f} m, "
+                f"diff={r.max_diffraction_loss_db:.1f} dB, "
+                f"nu={r.worst_nu:.2f}, "
+                f"best_az={r.best_azimuth_deg:.0f}°"
+            )
+
+        with open(self.csv_file, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "lat", "lon", "elev_m", "score",
+                "best_azimuth_deg",
+                "worst_horizon_deg", "avg_horizon_deg",
+                "min_fresnel_clearance_m", "avg_fresnel_clearance_m",
+                "max_diffraction_loss_db", "worst_nu"
+            ])
+            for r in results:
+                w.writerow([
+                    r.lat, r.lon, r.elev_m, r.score,
+                    r.best_azimuth_deg,
+                    r.worst_horizon_deg, r.avg_horizon_deg,
+                    r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m,
+                    r.max_diffraction_loss_db, r.worst_nu
+                ])
+
+        plt.figure(figsize=(10, 8))
+
+        if results:
+            lons = [r.lon for r in results]
+            lats = [r.lat for r in results]
+            scores = [r.score for r in results]
+
+            sc = plt.scatter(lons, lats, c=scores, s=22, cmap="viridis")
+            plt.colorbar(sc, label="Suitability score")
+
+        plt.scatter([self.center_lon], [self.center_lat], marker="x", s=120, label=self.center_name)
+
+        b = self.dem.bounds
+        plt.xlim(b.left, b.right)
+        plt.ylim(b.bottom, b.top)
+
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title(f"{self.plot_title} ({self.freq_mhz:.0f} MHz)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(self.plot_file, dpi=180)
+        plt.show()
 
 
 # ============================================================
-# MAIN
+# CONFIG
 # ============================================================
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 
 def main():
-    dem = DEMSampler(DEM_FILE)
-    candidates = generate_candidate_grid(CENTER_LAT, CENTER_LON, RADIUS_KM, GRID_STEP_KM)
+    args = parse_args()
+    cfg = load_config(args.config)
 
-    print(f"Generated candidate points: {len(candidates)}")
+    if args.freq_mhz is not None:
+        cfg["radio"]["freq_mhz"] = float(args.freq_mhz)
 
-    valid_dem_points = 0
-    high_enough_points = 0
-    results = []
+        base_csv = cfg["output"]["csv_file"]
+        base_plot = cfg["output"]["plot_file"]
 
-    for idx, (lat, lon) in enumerate(candidates, 1):
-        elev = dem.sample(lon, lat)
+        if base_csv.endswith(".csv"):
+            cfg["output"]["csv_file"] = base_csv[:-4] + f"_{int(args.freq_mhz)}MHz.csv"
+        if base_plot.endswith(".png"):
+            cfg["output"]["plot_file"] = base_plot[:-4] + f"_{int(args.freq_mhz)}MHz.png"
 
-        if not np.isnan(elev):
-            valid_dem_points += 1
-        if not np.isnan(elev) and elev >= MIN_SITE_ELEV_M:
-            high_enough_points += 1
-
-        r = evaluate_site(dem, lat, lon)
-        if r is not None:
-            results.append(r)
-
-        if idx % 200 == 0:
-            print(f"Processed {idx}/{len(candidates)}")
-
-    print()
-    print("Debug summary")
-    print("-------------")
-    print("Valid DEM points:", valid_dem_points)
-    print("Points above MIN_SITE_ELEV_M:", high_enough_points)
-    print("Final result points:", len(results))
-    print()
-
-    results.sort(key=lambda x: x.score, reverse=True)
-
-    print("Top 20 sites:")
-    for i, r in enumerate(results[:20], 1):
-        print(
-            f"{i:2d}. lat={r.lat:.5f}, lon={r.lon:.5f}, "
-            f"elev={r.elev_m:.0f} m, score={r.score:.3f}, "
-            f"worst_h={r.worst_horizon_deg:.2f}°, "
-            f"min_fc={r.min_fresnel_clearance_m:.1f} m, "
-            f"diff={r.max_diffraction_loss_db:.1f} dB, "
-            f"nu={r.worst_nu:.2f}, "
-            f"best_az={r.best_azimuth_deg:.0f}°"
-        )
-
-    with open("site_candidates_fresnel_diffraction.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "lat", "lon", "elev_m", "score",
-            "best_azimuth_deg",
-            "worst_horizon_deg", "avg_horizon_deg",
-            "min_fresnel_clearance_m", "avg_fresnel_clearance_m",
-            "max_diffraction_loss_db", "worst_nu"
-        ])
-        for r in results:
-            w.writerow([
-                r.lat, r.lon, r.elev_m, r.score,
-                r.best_azimuth_deg,
-                r.worst_horizon_deg, r.avg_horizon_deg,
-                r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m,
-                r.max_diffraction_loss_db, r.worst_nu
-            ])
-
-    plt.figure(figsize=(10, 8))
-
-    if results:
-        lons = [r.lon for r in results]
-        lats = [r.lat for r in results]
-        scores = [r.score for r in results]
-
-        sc = plt.scatter(lons, lats, c=scores, s=22, cmap="viridis")
-        plt.colorbar(sc, label="Suitability score")
-
-    plt.scatter([CENTER_LON], [CENTER_LAT], marker="x", s=120, label="Plovdiv")
-
-    b = dem.bounds
-    plt.xlim(b.left, b.right)
-    plt.ylim(b.bottom, b.top)
-
-    plt.xlabel("Longitude")
-    plt.ylabel("Latitude")
-    plt.title(f"Local horizon + Fresnel + diffraction ({FREQ_MHZ:.0f} MHz)")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("site_map_fresnel_diffraction.png", dpi=180)
-    plt.show()
+    scanner = RFScanner(cfg)
+    scanner.run()
 
 
 if __name__ == "__main__":

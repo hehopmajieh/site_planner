@@ -1,0 +1,39 @@
+{
+  "dem_file": "output_hh.tif",
+
+  "center": {
+    "lat": 42.1354,
+    "lon": 24.7453,
+    "name": "Plovdiv"
+  },
+
+  "scan": {
+    "radius_km": 60.0,
+    "grid_step_km": 2.5,
+    "min_site_elev_m": 300.0,
+    "antenna_height_m": 8.0
+  },
+
+  "sector": {
+    "look_distance_km": 30.0,
+    "profile_step_m": 250.0,
+    "azimuth_start_deg": 260.0,
+    "azimuth_end_deg": 330.0,
+    "azimuth_step_deg": 5.0
+  },
+
+  "radio": {
+    "freq_mhz": 144.0,
+    "k_factor": 1.3333333333
+  },
+
+  "earth": {
+    "radius_m": 6371000.0
+  },
+
+  "output": {
+    "csv_file": "site_candidates_fresnel_diffraction.csv",
+    "plot_file": "site_map_fresnel_diffraction.png",
+    "plot_title": "Local horizon + Fresnel + diffraction"
+  }
+}
