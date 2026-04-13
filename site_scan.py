@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 
 """
-Local horizon + Fresnel clearance scan for VHF/UHF contest site selection.
+Local horizon + Fresnel clearance + diffraction loss scan
+for VHF/UHF contest site selection.
 
 This script:
 - Loads a local DEM (GeoTIFF, EPSG:4326)
 - Generates candidate sites around Plovdiv
 - Evaluates local horizon toward a W/NW azimuth sector
-- Computes 60% first Fresnel zone clearance along the local path
+- Computes 60% first Fresnel zone clearance
+- Computes approximate knife-edge diffraction loss
 - Outputs ranked candidate sites
-
-The goal is not to model the full path to Germany/Italy/etc.
-Instead, it evaluates whether the local terrain near the site allows
-a good low-angle launch toward Western Europe.
 """
 
 import math
@@ -40,19 +38,15 @@ GRID_STEP_KM = 2.5
 MIN_SITE_ELEV_M = 300.0
 ANTENNA_HEIGHT_M = 8.0
 
-# Evaluate only local terrain in front of the site
 LOOK_DISTANCE_KM = 30.0
 PROFILE_STEP_M = 250.0
 
-# Azimuth sector toward Western / Northwestern Europe
 AZIMUTH_START_DEG = 260.0
 AZIMUTH_END_DEG = 330.0
 AZIMUTH_STEP_DEG = 5.0
 
-# Frequency in MHz
 FREQ_MHZ = 144.0
 
-# Earth radius and effective k-factor for standard refraction
 EARTH_RADIUS_M = 6371000.0
 K_FACTOR = 4.0 / 3.0
 
@@ -74,6 +68,8 @@ class SiteResult:
     avg_horizon_deg: float
     min_fresnel_clearance_m: float
     avg_fresnel_clearance_m: float
+    max_diffraction_loss_db: float
+    worst_nu: float
 
 
 # ============================================================
@@ -148,20 +144,25 @@ def generate_candidate_grid(center_lat, center_lon, radius_km, step_km):
 
 
 def fresnel_radius_m(d1_m: float, d2_m: float, freq_mhz: float) -> float:
-    """
-    First Fresnel zone radius.
-    """
     freq_hz = freq_mhz * 1e6
     wavelength_m = 3e8 / freq_hz
     return math.sqrt(wavelength_m * d1_m * d2_m / (d1_m + d2_m))
 
 
 def earth_bulge_m(d1_m: float, d2_m: float, k_factor: float = K_FACTOR) -> float:
-    """
-    Effective Earth bulge for standard atmosphere.
-    """
     reff = EARTH_RADIUS_M * k_factor
     return (d1_m * d2_m) / (2.0 * reff)
+
+
+def knife_edge_loss_db(nu: float) -> float:
+    """
+    ITU-style single knife-edge approximation.
+    """
+    if nu <= -0.78:
+        return 0.0
+    return 6.9 + 20.0 * math.log10(
+        math.sqrt((nu - 0.1) ** 2 + 1.0) + nu - 0.1
+    )
 
 
 # ============================================================
@@ -187,13 +188,6 @@ def sample_along_azimuth(dem, lat, lon, azimuth_deg, look_distance_km, step_m):
 
 
 def evaluate_azimuth(dem, lat, lon, azimuth_deg):
-    """
-    Evaluate a single azimuth from one candidate site.
-
-    Returns:
-    - horizon metrics
-    - 60% Fresnel clearance metrics
-    """
     dists, terr, valid = sample_along_azimuth(
         dem=dem,
         lat=lat,
@@ -211,9 +205,6 @@ def evaluate_azimuth(dem, lat, lon, azimuth_deg):
         return None
 
     tx_abs = site_ground + ANTENNA_HEIGHT_M
-
-    # For local launch analysis, use a shallow LOS target:
-    # same antenna height at the end of the inspected sector.
     rx_abs = terr[-1] + ANTENNA_HEIGHT_M
 
     total_m = dists[-1]
@@ -221,11 +212,12 @@ def evaluate_azimuth(dem, lat, lon, azimuth_deg):
 
     horizon_angles = []
     fresnel_clearances = []
+    nus = []
+    losses = []
 
     for i in range(1, len(dists) - 1):
         d = dists[i]
 
-        # Ignore the first 500 m to reduce local pixel noise
         if d < 500.0:
             continue
 
@@ -239,22 +231,35 @@ def evaluate_azimuth(dem, lat, lon, azimuth_deg):
         angle_deg = math.degrees(math.atan2(effective_terrain - tx_abs, d1))
         horizon_angles.append(angle_deg)
 
-        # 60% Fresnel clearance relative to LOS
+        # Fresnel
         fr = fresnel_radius_m(d1, d2, FREQ_MHZ)
         clearance = los[i] - effective_terrain - 0.6 * fr
         fresnel_clearances.append(clearance)
 
-    if not horizon_angles or not fresnel_clearances:
+        # Knife-edge diffraction parameter nu
+        # h is positive if obstacle is above LOS
+        h = effective_terrain - los[i]
+        nu = math.sqrt(2.0) * h / fr
+        nus.append(nu)
+
+        loss_db = knife_edge_loss_db(nu)
+        losses.append(loss_db)
+
+    if not horizon_angles or not fresnel_clearances or not losses:
         return None
 
     horizon_angles = np.array(horizon_angles, dtype=float)
     fresnel_clearances = np.array(fresnel_clearances, dtype=float)
+    nus = np.array(nus, dtype=float)
+    losses = np.array(losses, dtype=float)
 
     return {
         "worst_horizon_deg": float(np.percentile(horizon_angles, 99)),
         "avg_horizon_deg": float(np.percentile(horizon_angles, 95)),
         "min_fresnel_clearance_m": float(np.min(fresnel_clearances)),
         "avg_fresnel_clearance_m": float(np.mean(fresnel_clearances)),
+        "max_diffraction_loss_db": float(np.max(losses)),
+        "worst_nu": float(np.max(nus)),
     }
 
 
@@ -281,22 +286,26 @@ def evaluate_site(dem, lat, lon):
         avg_h = res["avg_horizon_deg"]
         min_fc = res["min_fresnel_clearance_m"]
         avg_fc = res["avg_fresnel_clearance_m"]
+        max_loss = res["max_diffraction_loss_db"]
+        worst_nu = res["worst_nu"]
 
-        # Lower horizon angle is better
         horizon_score = np.clip((3.0 - worst_h) / 3.0, 0.0, 1.0)
         avg_h_score = np.clip((2.0 - avg_h) / 2.0, 0.0, 1.0)
 
-        # Positive Fresnel clearance is good
         min_fc_score = np.clip((min_fc + 100.0) / 200.0, 0.0, 1.0)
         avg_fc_score = np.clip((avg_fc + 100.0) / 200.0, 0.0, 1.0)
+
+        # Lower diffraction loss is better
+        diff_score = np.clip((20.0 - max_loss) / 20.0, 0.0, 1.0)
 
         elev_score = np.clip((elev - MIN_SITE_ELEV_M) / 1800.0, 0.0, 1.0)
 
         score = (
-            0.30 * horizon_score +
-            0.15 * avg_h_score +
-            0.30 * min_fc_score +
-            0.15 * avg_fc_score +
+            0.22 * horizon_score +
+            0.10 * avg_h_score +
+            0.23 * min_fc_score +
+            0.10 * avg_fc_score +
+            0.25 * diff_score +
             0.10 * elev_score
         )
 
@@ -312,6 +321,8 @@ def evaluate_site(dem, lat, lon):
                 avg_horizon_deg=float(avg_h),
                 min_fresnel_clearance_m=float(min_fc),
                 avg_fresnel_clearance_m=float(avg_fc),
+                max_diffraction_loss_db=float(max_loss),
+                worst_nu=float(worst_nu),
             )
 
     return best_result
@@ -363,24 +374,27 @@ def main():
             f"elev={r.elev_m:.0f} m, score={r.score:.3f}, "
             f"worst_h={r.worst_horizon_deg:.2f}°, "
             f"min_fc={r.min_fresnel_clearance_m:.1f} m, "
-            f"avg_fc={r.avg_fresnel_clearance_m:.1f} m, "
+            f"diff={r.max_diffraction_loss_db:.1f} dB, "
+            f"nu={r.worst_nu:.2f}, "
             f"best_az={r.best_azimuth_deg:.0f}°"
         )
 
-    with open("site_candidates_fresnel.csv", "w", newline="", encoding="utf-8") as f:
+    with open("site_candidates_fresnel_diffraction.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
             "lat", "lon", "elev_m", "score",
             "best_azimuth_deg",
             "worst_horizon_deg", "avg_horizon_deg",
-            "min_fresnel_clearance_m", "avg_fresnel_clearance_m"
+            "min_fresnel_clearance_m", "avg_fresnel_clearance_m",
+            "max_diffraction_loss_db", "worst_nu"
         ])
         for r in results:
             w.writerow([
                 r.lat, r.lon, r.elev_m, r.score,
                 r.best_azimuth_deg,
                 r.worst_horizon_deg, r.avg_horizon_deg,
-                r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m
+                r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m,
+                r.max_diffraction_loss_db, r.worst_nu
             ])
 
     plt.figure(figsize=(10, 8))
@@ -401,11 +415,11 @@ def main():
 
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
-    plt.title(f"Local horizon + Fresnel suitability ({FREQ_MHZ:.0f} MHz)")
+    plt.title(f"Local horizon + Fresnel + diffraction ({FREQ_MHZ:.0f} MHz)")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("site_map_fresnel.png", dpi=180)
+    plt.savefig("site_map_fresnel_diffraction.png", dpi=180)
     plt.show()
 
 
