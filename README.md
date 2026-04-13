@@ -5,6 +5,10 @@
 
 This tool  uses **terrain (DEM) data** to identify optimal locations for VHF/UHF/SHF contest operation.
 
+There is no guarantee that this application will always generate correct data. This is a proof of concept (POC), and I assume no responsibility for its use.
+
+
+
 Goal:
 👉 find sites with **maximum RF visibility toward Western Europe**,  
 taking into account real-world RF propagation effects:
