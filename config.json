@@ -40,7 +40,8 @@
     "enable_top_site_plots": true,
     "top_n_sites": 3,
     "output_dir": "plots",
-    "show_on_screen": true
+    "show_on_screen": false,
+    "save_plots": true
   },
 
   "output": {

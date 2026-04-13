@@ -16,7 +16,7 @@ Features:
     * best contiguous good sector
 - Saves CSV and map
 - Optionally generates cartesian + polar plots for top N sites
-- Optionally shows those plots on screen
+- Can save plots, display them, or both
 """
 
 import math
@@ -145,6 +145,7 @@ class RFScanner:
         self.top_n_sites = int(plots_cfg.get("top_n_sites", 3))
         self.plots_output_dir = Path(plots_cfg.get("output_dir", "plots"))
         self.show_on_screen = bool(plots_cfg.get("show_on_screen", True))
+        self.save_plots = bool(plots_cfg.get("save_plots", True))
 
         self.dem = DEMSampler(self.dem_file)
 
@@ -436,7 +437,9 @@ class RFScanner:
         axes[3].grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(cartesian_file, dpi=180)
+
+        if self.save_plots:
+            plt.savefig(cartesian_file, dpi=180)
 
         if self.show_on_screen:
             plt.show()
@@ -459,15 +462,17 @@ class RFScanner:
             f"({site.lat:.5f}, {site.lon:.5f})"
         )
 
-        plt.savefig(polar_file, dpi=180)
+        if self.save_plots:
+            plt.savefig(polar_file, dpi=180)
 
         if self.show_on_screen:
             plt.show()
         else:
             plt.close(fig)
 
-        print(f"Saved: {cartesian_file}")
-        print(f"Saved: {polar_file}")
+        if self.save_plots:
+            print(f"Saved: {cartesian_file}")
+            print(f"Saved: {polar_file}")
 
     # --------------------------------------------------------
     # Run
@@ -566,7 +571,9 @@ class RFScanner:
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        plt.savefig(self.plot_file, dpi=180)
+
+        if self.save_plots:
+            plt.savefig(self.plot_file, dpi=180)
 
         if self.show_on_screen:
             plt.show()
