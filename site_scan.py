@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 
 """
-Local horizon + Fresnel clearance + diffraction loss scan
-for VHF/UHF contest site selection.
+Local horizon + Fresnel clearance + diffraction loss + azimuth coverage scan.
 
 This version:
-- reads all configuration from config.json
-- supports frequency selection from JSON
-- optionally allows CLI override for frequency
+- reads configuration from JSON
+- supports frequency override from CLI
+- evaluates all azimuths in the configured sector
+- computes:
+    * best azimuth
+    * number of good azimuths
+    * total usable azimuth width
+    * best contiguous usable width
+- ranks sites using both RF quality and sector usability
 """
 
 import math
@@ -22,18 +27,14 @@ from pyproj import Geod
 import matplotlib.pyplot as plt
 
 
-# ============================================================
-# CLI
-# ============================================================
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scan candidate sites using local horizon, Fresnel clearance and diffraction loss."
+        description="Scan candidate sites using local horizon, Fresnel clearance, diffraction and azimuth coverage."
     )
     parser.add_argument(
         "-c", "--config",
         default="config.json",
-        help="Path to JSON configuration file (default: config.json)"
+        help="Path to JSON configuration file"
     )
     parser.add_argument(
         "--freq-mhz",
@@ -43,10 +44,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-# ============================================================
-# DATA STRUCTURES
-# ============================================================
 
 @dataclass
 class SiteResult:
@@ -61,11 +58,10 @@ class SiteResult:
     avg_fresnel_clearance_m: float
     max_diffraction_loss_db: float
     worst_nu: float
+    good_azimuth_count: int
+    usable_azimuth_width_deg: float
+    best_contiguous_width_deg: float
 
-
-# ============================================================
-# DEM HANDLING
-# ============================================================
 
 class DEMSampler:
     def __init__(self, dem_file: str):
@@ -105,10 +101,6 @@ class DEMSampler:
         return float(val)
 
 
-# ============================================================
-# RF SCANNER
-# ============================================================
-
 class RFScanner:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -136,15 +128,14 @@ class RFScanner:
 
         self.earth_radius_m = cfg["earth"]["radius_m"]
 
+        self.good_min_fc = cfg["coverage"]["good_min_fresnel_clearance_m"]
+        self.good_max_diff_db = cfg["coverage"]["good_max_diffraction_loss_db"]
+
         self.csv_file = cfg["output"]["csv_file"]
         self.plot_file = cfg["output"]["plot_file"]
         self.plot_title = cfg["output"]["plot_title"]
 
         self.dem = DEMSampler(self.dem_file)
-
-    # --------------------------------------------------------
-    # Geometry
-    # --------------------------------------------------------
 
     def destination_point(self, lat: float, lon: float, azimuth_deg: float, distance_km: float):
         lon2, lat2, _ = self.geod.fwd(lon, lat, azimuth_deg, distance_km * 1000.0)
@@ -169,10 +160,6 @@ class RFScanner:
 
         return pts
 
-    # --------------------------------------------------------
-    # RF utilities
-    # --------------------------------------------------------
-
     def fresnel_radius_m(self, d1_m: float, d2_m: float) -> float:
         freq_hz = self.freq_mhz * 1e6
         wavelength_m = 3e8 / freq_hz
@@ -189,10 +176,6 @@ class RFScanner:
         return 6.9 + 20.0 * math.log10(
             math.sqrt((nu - 0.1) ** 2 + 1.0) + nu - 0.1
         )
-
-    # --------------------------------------------------------
-    # Profile analysis
-    # --------------------------------------------------------
 
     def sample_along_azimuth(self, lat: float, lon: float, azimuth_deg: float):
         total_m = self.look_distance_km * 1000.0
@@ -234,8 +217,6 @@ class RFScanner:
 
         for i in range(1, len(dists) - 1):
             d = dists[i]
-
-            # Ignore the first 500 m to reduce pixel noise near the site
             if d < 500.0:
                 continue
 
@@ -267,18 +248,33 @@ class RFScanner:
         nus = np.array(nus, dtype=float)
         losses = np.array(losses, dtype=float)
 
+        min_fc = float(np.min(fresnel_clearances))
+        max_loss = float(np.max(losses))
+
+        is_good = (min_fc > self.good_min_fc) and (max_loss <= self.good_max_diff_db)
+
         return {
             "worst_horizon_deg": float(np.percentile(horizon_angles, 99)),
             "avg_horizon_deg": float(np.percentile(horizon_angles, 95)),
-            "min_fresnel_clearance_m": float(np.min(fresnel_clearances)),
+            "min_fresnel_clearance_m": min_fc,
             "avg_fresnel_clearance_m": float(np.mean(fresnel_clearances)),
-            "max_diffraction_loss_db": float(np.max(losses)),
+            "max_diffraction_loss_db": max_loss,
             "worst_nu": float(np.max(nus)),
+            "is_good": is_good
         }
 
-    # --------------------------------------------------------
-    # Site evaluation
-    # --------------------------------------------------------
+    def contiguous_width_deg(self, good_flags):
+        best_run = 0
+        current_run = 0
+
+        for flag in good_flags:
+            if flag:
+                current_run += 1
+                best_run = max(best_run, current_run)
+            else:
+                current_run = 0
+
+        return best_run * self.azimuth_step_deg
 
     def evaluate_site(self, lat: float, lon: float):
         elev = self.dem.sample(lon, lat)
@@ -291,14 +287,25 @@ class RFScanner:
             self.azimuth_step_deg
         )
 
-        best_score = -1e9
-        best_result = None
-
+        az_results = []
         for az in azimuths:
             res = self.evaluate_azimuth(lat, lon, float(az))
             if res is None:
                 continue
+            az_results.append((float(az), res))
 
+        if not az_results:
+            return None
+
+        good_flags = [res["is_good"] for _, res in az_results]
+        good_count = sum(good_flags)
+        usable_width_deg = good_count * self.azimuth_step_deg
+        best_contig_deg = self.contiguous_width_deg(good_flags)
+
+        best_score = -1e9
+        best_result = None
+
+        for az, res in az_results:
             worst_h = res["worst_horizon_deg"]
             avg_h = res["avg_horizon_deg"]
             min_fc = res["min_fresnel_clearance_m"]
@@ -313,13 +320,19 @@ class RFScanner:
             diff_score = np.clip((20.0 - max_loss) / 20.0, 0.0, 1.0)
             elev_score = np.clip((elev - self.min_site_elev_m) / 1800.0, 0.0, 1.0)
 
+            total_sector_width = (self.azimuth_end_deg - self.azimuth_start_deg)
+            usable_width_score = np.clip(usable_width_deg / total_sector_width, 0.0, 1.0)
+            contig_width_score = np.clip(best_contig_deg / total_sector_width, 0.0, 1.0)
+
             score = (
-                0.22 * horizon_score +
-                0.10 * avg_h_score +
-                0.23 * min_fc_score +
-                0.10 * avg_fc_score +
-                0.25 * diff_score +
-                0.10 * elev_score
+                0.17 * horizon_score +
+                0.08 * avg_h_score +
+                0.18 * min_fc_score +
+                0.08 * avg_fc_score +
+                0.18 * diff_score +
+                0.08 * elev_score +
+                0.11 * usable_width_score +
+                0.12 * contig_width_score
             )
 
             if score > best_score:
@@ -336,13 +349,12 @@ class RFScanner:
                     avg_fresnel_clearance_m=float(avg_fc),
                     max_diffraction_loss_db=float(max_loss),
                     worst_nu=float(worst_nu),
+                    good_azimuth_count=int(good_count),
+                    usable_azimuth_width_deg=float(usable_width_deg),
+                    best_contiguous_width_deg=float(best_contig_deg),
                 )
 
         return best_result
-
-    # --------------------------------------------------------
-    # Run
-    # --------------------------------------------------------
 
     def run(self):
         candidates = self.generate_candidate_grid()
@@ -383,11 +395,11 @@ class RFScanner:
             print(
                 f"{i:2d}. lat={r.lat:.5f}, lon={r.lon:.5f}, "
                 f"elev={r.elev_m:.0f} m, score={r.score:.3f}, "
-                f"worst_h={r.worst_horizon_deg:.2f}°, "
+                f"best_az={r.best_azimuth_deg:.0f}°, "
                 f"min_fc={r.min_fresnel_clearance_m:.1f} m, "
                 f"diff={r.max_diffraction_loss_db:.1f} dB, "
-                f"nu={r.worst_nu:.2f}, "
-                f"best_az={r.best_azimuth_deg:.0f}°"
+                f"usable={r.usable_azimuth_width_deg:.0f}°, "
+                f"contig={r.best_contiguous_width_deg:.0f}°"
             )
 
         with open(self.csv_file, "w", newline="", encoding="utf-8") as f:
@@ -397,7 +409,10 @@ class RFScanner:
                 "best_azimuth_deg",
                 "worst_horizon_deg", "avg_horizon_deg",
                 "min_fresnel_clearance_m", "avg_fresnel_clearance_m",
-                "max_diffraction_loss_db", "worst_nu"
+                "max_diffraction_loss_db", "worst_nu",
+                "good_azimuth_count",
+                "usable_azimuth_width_deg",
+                "best_contiguous_width_deg"
             ])
             for r in results:
                 w.writerow([
@@ -405,7 +420,10 @@ class RFScanner:
                     r.best_azimuth_deg,
                     r.worst_horizon_deg, r.avg_horizon_deg,
                     r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m,
-                    r.max_diffraction_loss_db, r.worst_nu
+                    r.max_diffraction_loss_db, r.worst_nu,
+                    r.good_azimuth_count,
+                    r.usable_azimuth_width_deg,
+                    r.best_contiguous_width_deg
                 ])
 
         plt.figure(figsize=(10, 8))
@@ -433,10 +451,6 @@ class RFScanner:
         plt.savefig(self.plot_file, dpi=180)
         plt.show()
 
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:

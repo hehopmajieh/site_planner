@@ -31,9 +31,14 @@
     "radius_m": 6371000.0
   },
 
+  "coverage": {
+    "good_min_fresnel_clearance_m": 0.0,
+    "good_max_diffraction_loss_db": 3.0
+  },
+
   "output": {
-    "csv_file": "site_candidates_fresnel_diffraction.csv",
-    "plot_file": "site_map_fresnel_diffraction.png",
-    "plot_title": "Local horizon + Fresnel + diffraction"
+    "csv_file": "site_candidates_coverage.csv",
+    "plot_file": "site_map_coverage.png",
+    "plot_title": "Local horizon + Fresnel + diffraction + azimuth coverage"
   }
 }
