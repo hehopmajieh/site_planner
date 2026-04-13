@@ -36,6 +36,13 @@
     "good_max_diffraction_loss_db": 3.0
   },
 
+  "plots": {
+    "enable_top_site_plots": true,
+    "top_n_sites": 3,
+    "output_dir": "plots",
+    "show_on_screen": true
+  },
+
   "output": {
     "csv_file": "site_candidates_coverage.csv",
     "plot_file": "site_map_coverage.png",

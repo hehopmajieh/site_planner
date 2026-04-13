@@ -3,16 +3,20 @@
 """
 Local horizon + Fresnel clearance + diffraction loss + azimuth coverage scan.
 
-This version:
-- reads configuration from JSON
-- supports frequency override from CLI
-- evaluates all azimuths in the configured sector
-- computes:
+Features:
+- Reads configuration from JSON
+- Supports CLI frequency override
+- Evaluates candidate sites around a center point
+- Computes:
     * best azimuth
-    * number of good azimuths
-    * total usable azimuth width
-    * best contiguous usable width
-- ranks sites using both RF quality and sector usability
+    * horizon metrics
+    * Fresnel clearance
+    * diffraction loss
+    * azimuth coverage width
+    * best contiguous good sector
+- Saves CSV and map
+- Optionally generates cartesian + polar plots for top N sites
+- Optionally shows those plots on screen
 """
 
 import math
@@ -20,6 +24,7 @@ import csv
 import json
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -29,7 +34,7 @@ import matplotlib.pyplot as plt
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scan candidate sites using local horizon, Fresnel clearance, diffraction and azimuth coverage."
+        description="Scan candidate RF sites using local horizon, Fresnel clearance, diffraction and azimuth coverage."
     )
     parser.add_argument(
         "-c", "--config",
@@ -135,7 +140,17 @@ class RFScanner:
         self.plot_file = cfg["output"]["plot_file"]
         self.plot_title = cfg["output"]["plot_title"]
 
+        plots_cfg = cfg.get("plots", {})
+        self.enable_top_site_plots = plots_cfg.get("enable_top_site_plots", False)
+        self.top_n_sites = int(plots_cfg.get("top_n_sites", 3))
+        self.plots_output_dir = Path(plots_cfg.get("output_dir", "plots"))
+        self.show_on_screen = bool(plots_cfg.get("show_on_screen", True))
+
         self.dem = DEMSampler(self.dem_file)
+
+    # --------------------------------------------------------
+    # Geometry
+    # --------------------------------------------------------
 
     def destination_point(self, lat: float, lon: float, azimuth_deg: float, distance_km: float):
         lon2, lat2, _ = self.geod.fwd(lon, lat, azimuth_deg, distance_km * 1000.0)
@@ -160,6 +175,10 @@ class RFScanner:
 
         return pts
 
+    # --------------------------------------------------------
+    # RF utilities
+    # --------------------------------------------------------
+
     def fresnel_radius_m(self, d1_m: float, d2_m: float) -> float:
         freq_hz = self.freq_mhz * 1e6
         wavelength_m = 3e8 / freq_hz
@@ -176,6 +195,10 @@ class RFScanner:
         return 6.9 + 20.0 * math.log10(
             math.sqrt((nu - 0.1) ** 2 + 1.0) + nu - 0.1
         )
+
+    # --------------------------------------------------------
+    # Profile analysis
+    # --------------------------------------------------------
 
     def sample_along_azimuth(self, lat: float, lon: float, azimuth_deg: float):
         total_m = self.look_distance_km * 1000.0
@@ -250,7 +273,6 @@ class RFScanner:
 
         min_fc = float(np.min(fresnel_clearances))
         max_loss = float(np.max(losses))
-
         is_good = (min_fc > self.good_min_fc) and (max_loss <= self.good_max_diff_db)
 
         return {
@@ -262,6 +284,24 @@ class RFScanner:
             "worst_nu": float(np.max(nus)),
             "is_good": is_good
         }
+
+    def analyze_site_azimuths(self, lat: float, lon: float):
+        azimuths = np.arange(
+            self.azimuth_start_deg,
+            self.azimuth_end_deg + 0.1,
+            self.azimuth_step_deg
+        )
+
+        az_results = []
+        for az in azimuths:
+            res = self.evaluate_azimuth(lat, lon, float(az))
+            if res is not None:
+                az_results.append((float(az), res))
+        return az_results
+
+    # --------------------------------------------------------
+    # Site scoring
+    # --------------------------------------------------------
 
     def contiguous_width_deg(self, good_flags):
         best_run = 0
@@ -281,19 +321,7 @@ class RFScanner:
         if np.isnan(elev) or elev < self.min_site_elev_m:
             return None
 
-        azimuths = np.arange(
-            self.azimuth_start_deg,
-            self.azimuth_end_deg + 0.1,
-            self.azimuth_step_deg
-        )
-
-        az_results = []
-        for az in azimuths:
-            res = self.evaluate_azimuth(lat, lon, float(az))
-            if res is None:
-                continue
-            az_results.append((float(az), res))
-
+        az_results = self.analyze_site_azimuths(lat, lon)
         if not az_results:
             return None
 
@@ -355,6 +383,95 @@ class RFScanner:
                 )
 
         return best_result
+
+    # --------------------------------------------------------
+    # Plotting helpers
+    # --------------------------------------------------------
+
+    def sanitize_name(self, text: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+
+    def plot_site_details(self, rows, site: SiteResult, rank: int):
+        if not rows:
+            return
+
+        self.plots_output_dir.mkdir(parents=True, exist_ok=True)
+
+        az = np.array([r[0] for r in rows], dtype=float)
+        worst_h = np.array([r[1]["worst_horizon_deg"] for r in rows], dtype=float)
+        min_fc = np.array([r[1]["min_fresnel_clearance_m"] for r in rows], dtype=float)
+        diff_db = np.array([r[1]["max_diffraction_loss_db"] for r in rows], dtype=float)
+        good = np.array([1 if r[1]["is_good"] else 0 for r in rows], dtype=int)
+
+        base_name = f"site_{rank:02d}_{self.sanitize_name(f'{site.lat:.5f}_{site.lon:.5f}')}"
+        cartesian_file = self.plots_output_dir / f"{base_name}_cartesian.png"
+        polar_file = self.plots_output_dir / f"{base_name}_polar.png"
+
+        # Cartesian figure
+        fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
+
+        axes[0].plot(az, worst_h)
+        axes[0].axhline(0.0, linestyle="--")
+        axes[0].set_ylabel("Horizon (deg)")
+        axes[0].set_title(
+            f"Site #{rank}: ({site.lat:.5f}, {site.lon:.5f}), "
+            f"elev={site.elev_m:.0f} m, freq={self.freq_mhz:.0f} MHz"
+        )
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(az, min_fc)
+        axes[1].axhline(0.0, linestyle="--")
+        axes[1].set_ylabel("Min Fresnel (m)")
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(az, diff_db)
+        axes[2].axhline(self.good_max_diff_db, linestyle="--")
+        axes[2].set_ylabel("Diffraction (dB)")
+        axes[2].grid(True, alpha=0.3)
+
+        axes[3].step(az, good, where="mid")
+        axes[3].set_ylabel("Good")
+        axes[3].set_xlabel("Azimuth (deg)")
+        axes[3].set_yticks([0, 1])
+        axes[3].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(cartesian_file, dpi=180)
+
+        if self.show_on_screen:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # Polar figure
+        fig = plt.figure(figsize=(9, 9))
+        ax = fig.add_subplot(111, projection="polar")
+
+        theta = np.deg2rad(az)
+        radial = np.clip(5.0 - worst_h, 0.1, None)
+        colors = np.where(good == 1, 1.0, 0.2)
+
+        ax.scatter(theta, radial, c=colors, s=80)
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+        ax.set_title(
+            f"Polar RF view #{rank} - {self.freq_mhz:.0f} MHz\n"
+            f"({site.lat:.5f}, {site.lon:.5f})"
+        )
+
+        plt.savefig(polar_file, dpi=180)
+
+        if self.show_on_screen:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        print(f"Saved: {cartesian_file}")
+        print(f"Saved: {polar_file}")
+
+    # --------------------------------------------------------
+    # Run
+    # --------------------------------------------------------
 
     def run(self):
         candidates = self.generate_candidate_grid()
@@ -426,7 +543,8 @@ class RFScanner:
                     r.best_contiguous_width_deg
                 ])
 
-        plt.figure(figsize=(10, 8))
+        # Main map
+        fig = plt.figure(figsize=(10, 8))
 
         if results:
             lons = [r.lon for r in results]
@@ -449,7 +567,19 @@ class RFScanner:
         plt.legend()
         plt.tight_layout()
         plt.savefig(self.plot_file, dpi=180)
-        plt.show()
+
+        if self.show_on_screen:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        # Top site plots
+        if self.enable_top_site_plots and results:
+            print()
+            print(f"Generating plots for top {min(self.top_n_sites, len(results))} sites...")
+            for idx, site in enumerate(results[:self.top_n_sites], 1):
+                rows = self.analyze_site_azimuths(site.lat, site.lon)
+                self.plot_site_details(rows, site, idx)
 
 
 def load_config(path: str) -> dict:
