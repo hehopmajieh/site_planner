@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 
+"""
+Local horizon + Fresnel clearance scan for VHF/UHF contest site selection.
+
+This script:
+- Loads a local DEM (GeoTIFF, EPSG:4326)
+- Generates candidate sites around Plovdiv
+- Evaluates local horizon toward a W/NW azimuth sector
+- Computes 60% first Fresnel zone clearance along the local path
+- Outputs ranked candidate sites
+
+The goal is not to model the full path to Germany/Italy/etc.
+Instead, it evaluates whether the local terrain near the site allows
+a good low-angle launch toward Western Europe.
+"""
+
 import math
 import csv
 from dataclasses import dataclass
@@ -8,6 +23,7 @@ import numpy as np
 import rasterio
 from pyproj import Geod
 import matplotlib.pyplot as plt
+
 
 # ============================================================
 # CONFIGURATION
@@ -24,17 +40,28 @@ GRID_STEP_KM = 2.5
 MIN_SITE_ELEV_M = 300.0
 ANTENNA_HEIGHT_M = 8.0
 
-# How far to inspect the local horizon from each site
+# Evaluate only local terrain in front of the site
 LOOK_DISTANCE_KM = 30.0
 PROFILE_STEP_M = 250.0
 
-# Azimuth sector toward West / Northwest Europe
+# Azimuth sector toward Western / Northwestern Europe
 AZIMUTH_START_DEG = 260.0
 AZIMUTH_END_DEG = 330.0
 AZIMUTH_STEP_DEG = 5.0
 
+# Frequency in MHz
+FREQ_MHZ = 144.0
+
+# Earth radius and effective k-factor for standard refraction
+EARTH_RADIUS_M = 6371000.0
+K_FACTOR = 4.0 / 3.0
+
 geod = Geod(ellps="WGS84")
 
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
 
 @dataclass
 class SiteResult:
@@ -42,10 +69,16 @@ class SiteResult:
     lon: float
     elev_m: float
     score: float
+    best_azimuth_deg: float
     worst_horizon_deg: float
     avg_horizon_deg: float
-    best_azimuth_deg: float
+    min_fresnel_clearance_m: float
+    avg_fresnel_clearance_m: float
 
+
+# ============================================================
+# DEM HANDLING
+# ============================================================
 
 class DEMSampler:
     def __init__(self, dem_file: str):
@@ -85,6 +118,10 @@ class DEMSampler:
         return float(val)
 
 
+# ============================================================
+# GEOMETRY / RF UTILS
+# ============================================================
+
 def destination_point(lat: float, lon: float, azimuth_deg: float, distance_km: float):
     lon2, lat2, _ = geod.fwd(lon, lat, azimuth_deg, distance_km * 1000.0)
     return lat2, lon2
@@ -110,92 +147,179 @@ def generate_candidate_grid(center_lat, center_lon, radius_km, step_km):
     return pts
 
 
-def horizon_along_azimuth(dem, lat, lon, azimuth_deg, look_distance_km, antenna_height_m, step_m):
-    site_ground = dem.sample(lon, lat)
-    if np.isnan(site_ground):
-        return None
+def fresnel_radius_m(d1_m: float, d2_m: float, freq_mhz: float) -> float:
+    """
+    First Fresnel zone radius.
+    """
+    freq_hz = freq_mhz * 1e6
+    wavelength_m = 3e8 / freq_hz
+    return math.sqrt(wavelength_m * d1_m * d2_m / (d1_m + d2_m))
 
-    site_abs = site_ground + antenna_height_m
 
-    n = max(2, int((look_distance_km * 1000.0) / step_m) + 1)
-    dists = np.linspace(step_m, look_distance_km * 1000.0, n)
+def earth_bulge_m(d1_m: float, d2_m: float, k_factor: float = K_FACTOR) -> float:
+    """
+    Effective Earth bulge for standard atmosphere.
+    """
+    reff = EARTH_RADIUS_M * k_factor
+    return (d1_m * d2_m) / (2.0 * reff)
 
-    angles = []
+
+# ============================================================
+# PROFILE ANALYSIS
+# ============================================================
+
+def sample_along_azimuth(dem, lat, lon, azimuth_deg, look_distance_km, step_m):
+    total_m = look_distance_km * 1000.0
+    n = max(2, int(total_m / step_m) + 1)
+    dists = np.linspace(0.0, total_m, n)
+
+    elev = []
+    valid = True
+
     for d in dists:
         lonx, latx, _ = geod.fwd(lon, lat, azimuth_deg, d)
         h = dem.sample(lonx, latx)
+        elev.append(h)
         if np.isnan(h):
-            return None
+            valid = False
 
-        angle_deg = math.degrees(math.atan2(h - site_abs, d))
-        angles.append(angle_deg)
+    return dists, np.array(elev, dtype=float), valid
 
-    if not angles:
+
+def evaluate_azimuth(dem, lat, lon, azimuth_deg):
+    """
+    Evaluate a single azimuth from one candidate site.
+
+    Returns:
+    - horizon metrics
+    - 60% Fresnel clearance metrics
+    """
+    dists, terr, valid = sample_along_azimuth(
+        dem=dem,
+        lat=lat,
+        lon=lon,
+        azimuth_deg=azimuth_deg,
+        look_distance_km=LOOK_DISTANCE_KM,
+        step_m=PROFILE_STEP_M,
+    )
+
+    if not valid or len(dists) < 3:
         return None
 
-    angles = np.array(angles, dtype=float)
+    site_ground = terr[0]
+    if np.isnan(site_ground):
+        return None
+
+    tx_abs = site_ground + ANTENNA_HEIGHT_M
+
+    # For local launch analysis, use a shallow LOS target:
+    # same antenna height at the end of the inspected sector.
+    rx_abs = terr[-1] + ANTENNA_HEIGHT_M
+
+    total_m = dists[-1]
+    los = tx_abs + (rx_abs - tx_abs) * (dists / total_m)
+
+    horizon_angles = []
+    fresnel_clearances = []
+
+    for i in range(1, len(dists) - 1):
+        d = dists[i]
+
+        # Ignore the first 500 m to reduce local pixel noise
+        if d < 500.0:
+            continue
+
+        d1 = d
+        d2 = total_m - d
+
+        bulge = earth_bulge_m(d1, d2, K_FACTOR)
+        effective_terrain = terr[i] + bulge
+
+        # Horizon angle
+        angle_deg = math.degrees(math.atan2(effective_terrain - tx_abs, d1))
+        horizon_angles.append(angle_deg)
+
+        # 60% Fresnel clearance relative to LOS
+        fr = fresnel_radius_m(d1, d2, FREQ_MHZ)
+        clearance = los[i] - effective_terrain - 0.6 * fr
+        fresnel_clearances.append(clearance)
+
+    if not horizon_angles or not fresnel_clearances:
+        return None
+
+    horizon_angles = np.array(horizon_angles, dtype=float)
+    fresnel_clearances = np.array(fresnel_clearances, dtype=float)
 
     return {
-        "max_horizon_deg": float(np.max(angles)),
-        "p95_horizon_deg": float(np.percentile(angles, 95)),
-        "p99_horizon_deg": float(np.percentile(angles, 99)),
+        "worst_horizon_deg": float(np.percentile(horizon_angles, 99)),
+        "avg_horizon_deg": float(np.percentile(horizon_angles, 95)),
+        "min_fresnel_clearance_m": float(np.min(fresnel_clearances)),
+        "avg_fresnel_clearance_m": float(np.mean(fresnel_clearances)),
     }
 
+
+# ============================================================
+# SITE EVALUATION
+# ============================================================
 
 def evaluate_site(dem, lat, lon):
     elev = dem.sample(lon, lat)
     if np.isnan(elev) or elev < MIN_SITE_ELEV_M:
         return None
 
-    best_score = -1e9
-    best_azimuth = None
-    best_worst_h = None
-    best_avg_h = None
-
     azimuths = np.arange(AZIMUTH_START_DEG, AZIMUTH_END_DEG + 0.1, AZIMUTH_STEP_DEG)
 
+    best_score = -1e9
+    best_result = None
+
     for az in azimuths:
-        hm = horizon_along_azimuth(
-            dem=dem,
-            lat=lat,
-            lon=lon,
-            azimuth_deg=float(az),
-            look_distance_km=LOOK_DISTANCE_KM,
-            antenna_height_m=ANTENNA_HEIGHT_M,
-            step_m=PROFILE_STEP_M,
-        )
-        if hm is None:
+        res = evaluate_azimuth(dem, lat, lon, float(az))
+        if res is None:
             continue
 
-        worst_h = hm["p99_horizon_deg"]
-        avg_h = hm["p95_horizon_deg"]
+        worst_h = res["worst_horizon_deg"]
+        avg_h = res["avg_horizon_deg"]
+        min_fc = res["min_fresnel_clearance_m"]
+        avg_fc = res["avg_fresnel_clearance_m"]
 
         # Lower horizon angle is better
         horizon_score = np.clip((3.0 - worst_h) / 3.0, 0.0, 1.0)
-        avg_score = np.clip((2.0 - avg_h) / 2.0, 0.0, 1.0)
+        avg_h_score = np.clip((2.0 - avg_h) / 2.0, 0.0, 1.0)
+
+        # Positive Fresnel clearance is good
+        min_fc_score = np.clip((min_fc + 100.0) / 200.0, 0.0, 1.0)
+        avg_fc_score = np.clip((avg_fc + 100.0) / 200.0, 0.0, 1.0)
+
         elev_score = np.clip((elev - MIN_SITE_ELEV_M) / 1800.0, 0.0, 1.0)
 
-        score = 0.55 * horizon_score + 0.20 * avg_score + 0.25 * elev_score
+        score = (
+            0.30 * horizon_score +
+            0.15 * avg_h_score +
+            0.30 * min_fc_score +
+            0.15 * avg_fc_score +
+            0.10 * elev_score
+        )
 
         if score > best_score:
             best_score = score
-            best_azimuth = float(az)
-            best_worst_h = worst_h
-            best_avg_h = avg_h
+            best_result = SiteResult(
+                lat=lat,
+                lon=lon,
+                elev_m=float(elev),
+                score=float(score),
+                best_azimuth_deg=float(az),
+                worst_horizon_deg=float(worst_h),
+                avg_horizon_deg=float(avg_h),
+                min_fresnel_clearance_m=float(min_fc),
+                avg_fresnel_clearance_m=float(avg_fc),
+            )
 
-    if best_azimuth is None:
-        return None
+    return best_result
 
-    return SiteResult(
-        lat=lat,
-        lon=lon,
-        elev_m=float(elev),
-        score=float(best_score),
-        worst_horizon_deg=float(best_worst_h),
-        avg_horizon_deg=float(best_avg_h),
-        best_azimuth_deg=float(best_azimuth),
-    )
 
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     dem = DEMSampler(DEM_FILE)
@@ -212,7 +336,6 @@ def main():
 
         if not np.isnan(elev):
             valid_dem_points += 1
-
         if not np.isnan(elev) and elev >= MIN_SITE_ELEV_M:
             high_enough_points += 1
 
@@ -238,20 +361,26 @@ def main():
         print(
             f"{i:2d}. lat={r.lat:.5f}, lon={r.lon:.5f}, "
             f"elev={r.elev_m:.0f} m, score={r.score:.3f}, "
-            f"worst_h={r.worst_horizon_deg:.2f}°, avg_h={r.avg_horizon_deg:.2f}°, "
+            f"worst_h={r.worst_horizon_deg:.2f}°, "
+            f"min_fc={r.min_fresnel_clearance_m:.1f} m, "
+            f"avg_fc={r.avg_fresnel_clearance_m:.1f} m, "
             f"best_az={r.best_azimuth_deg:.0f}°"
         )
 
-    with open("site_candidates.csv", "w", newline="", encoding="utf-8") as f:
+    with open("site_candidates_fresnel.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
             "lat", "lon", "elev_m", "score",
-            "worst_horizon_deg", "avg_horizon_deg", "best_azimuth_deg"
+            "best_azimuth_deg",
+            "worst_horizon_deg", "avg_horizon_deg",
+            "min_fresnel_clearance_m", "avg_fresnel_clearance_m"
         ])
         for r in results:
             w.writerow([
                 r.lat, r.lon, r.elev_m, r.score,
-                r.worst_horizon_deg, r.avg_horizon_deg, r.best_azimuth_deg
+                r.best_azimuth_deg,
+                r.worst_horizon_deg, r.avg_horizon_deg,
+                r.min_fresnel_clearance_m, r.avg_fresnel_clearance_m
             ])
 
     plt.figure(figsize=(10, 8))
@@ -272,11 +401,11 @@ def main():
 
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
-    plt.title("Local horizon suitability for West Europe")
+    plt.title(f"Local horizon + Fresnel suitability ({FREQ_MHZ:.0f} MHz)")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("site_map.png", dpi=180)
+    plt.savefig("site_map_fresnel.png", dpi=180)
     plt.show()
 
 
